@@ -11,7 +11,7 @@ from javax.swing import (JPanel, JButton, JFileChooser, JScrollPane, JTable,
                          JLabel, JSpinner, SpinnerNumberModel, JCheckBox,
                          SwingUtilities, JSplitPane, JPopupMenu, JMenuItem,
                          JDialog, JFrame, BoxLayout, BorderFactory, JTextField,
-                         JTextArea, JProgressBar)
+                         JTextArea, JProgressBar, ListSelectionModel)
 from javax.swing.table import AbstractTableModel, TableRowSorter
 from javax.swing.event import ListSelectionListener
 from java.net import URL, InetAddress
@@ -83,6 +83,8 @@ class BulkRequester(IBurpExtender, ITab, IMessageEditorController):
         self._clear_btn = JButton(u"清空结果", actionPerformed=self._clear_table)
         self._columns_btn = JButton(u"列设置", actionPerformed=self._show_column_config)
         self._request_config_btn = JButton(u"请求设置", actionPerformed=self._show_request_config)
+        self._delete_selected_btn = JButton(u"删除选中", actionPerformed=self._delete_selected)
+        self._export_btn = JButton(u"导出请求", actionPerformed=self._export_remaining)
         self._start_btn.setEnabled(False)
         self._reload_btn.setEnabled(False)
         self._thread_spinner = JSpinner(SpinnerNumberModel(5, 1, 50, 1))
@@ -93,6 +95,8 @@ class BulkRequester(IBurpExtender, ITab, IMessageEditorController):
         self._top_panel.add(self._thread_spinner)
         self._top_panel.add(self._redirect_chk)
         self._top_panel.add(self._clear_btn)
+        self._top_panel.add(self._delete_selected_btn)
+        self._top_panel.add(self._export_btn)
         self._top_panel.add(self._columns_btn)
         self._top_panel.add(self._request_config_btn)
         self._top_panel.add(self._start_btn)
@@ -117,6 +121,7 @@ class BulkRequester(IBurpExtender, ITab, IMessageEditorController):
         self._table_model = self._ResultTableModel(self)
         self._table = JTable(self._table_model)
         self._table.setPreferredScrollableViewportSize(Dimension(800, 300))
+        self._table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION)
         
         # 添加排序功能
         self._row_sorter = TableRowSorter(self._table_model)
@@ -144,7 +149,7 @@ class BulkRequester(IBurpExtender, ITab, IMessageEditorController):
         repeater_item = JMenuItem(u"发送到 Repeater", actionPerformed=self._send_to_repeater)
         intruder_item = JMenuItem(u"发送到 Intruder", actionPerformed=self._send_to_intruder)
         comparer_item = JMenuItem(u"发送到 Comparer", actionPerformed=self._send_to_comparer)
-        delete_item = JMenuItem(u"删除条目", actionPerformed=self._delete_selected)
+        delete_item = JMenuItem(u"删除选中", actionPerformed=self._delete_selected)
         self._popup.add(repeater_item)
         self._popup.add(intruder_item)
         self._popup.add(comparer_item)
@@ -675,33 +680,73 @@ class BulkRequester(IBurpExtender, ITab, IMessageEditorController):
         self._callbacks.sendToComparer(msg)
 
     def _delete_selected(self, _):
-        row = self._table.getSelectedRow()
-        if row < 0:
+        """删除选中的多行（支持批量删除）"""
+        selected_rows = self._table.getSelectedRows()
+        if not selected_rows:
             return
-        model_row = self._table.convertRowIndexToModel(row)
-        if model_row >= self._messages.size():
-            return
-        
+
+        # 转换为模型行索引并排序（从大到小，方便从后往前删除）
+        model_rows = sorted([self._table.convertRowIndexToModel(row) for row in selected_rows], reverse=True)
+
         with self._message_lock:
-            # 删除消息和相关映射
-            self._messages.remove(model_row)
-            
-            # 更新所有映射，删除指定行并调整后续行的索引
-            def update_map(map_dict):
-                new_map = {}
-                for key, value in map_dict.items():
-                    if key < model_row:
-                        new_map[key] = value
-                    elif key > model_row:
-                        new_map[key - 1] = value
-                    # key == model_row 的项被删除
-                return new_map
-            
-            self._redirect_map = update_map(self._redirect_map)
-            self._msg_url_map = update_map(self._msg_url_map)
-            self._elapsed_map = update_map(self._elapsed_map)
-            
+            for model_row in model_rows:
+                if model_row < self._messages.size():
+                    # 删除消息
+                    self._messages.remove(model_row)
+
+                    # 更新所有映射，删除指定行并调整后续行的索引
+                    def update_map(map_dict):
+                        new_map = {}
+                        for key, value in map_dict.items():
+                            if key < model_row:
+                                new_map[key] = value
+                            elif key > model_row:
+                                new_map[key - 1] = value
+                            # key == model_row 的项被删除
+                        return new_map
+
+                    self._redirect_map = update_map(self._redirect_map)
+                    self._msg_url_map = update_map(self._msg_url_map)
+                    self._elapsed_map = update_map(self._elapsed_map)
+
             self._table_model.fireTableDataChanged()
+
+        self._callbacks.printOutput(u"已删除 %d 条记录" % len(model_rows))
+
+    def _export_remaining(self, _):
+        """导出剩余的请求为txt文件"""
+        if self._messages.size() == 0:
+            self._callbacks.printError(u"没有可导出的请求")
+            return
+
+        # 弹出文件保存对话框
+        chooser = JFileChooser()
+        chooser.setDialogTitle(u"导出剩余请求")
+        # 设置默认文件名
+        from javax.swing.filechooser import FileNameExtensionFilter
+        chooser.setSelectedFile(File("remaining_requests.txt"))
+        if chooser.showSaveDialog(self._main_panel) != JFileChooser.APPROVE_OPTION:
+            return
+
+        file_path = chooser.getSelectedFile().getAbsolutePath()
+        # 确保以.txt结尾
+        if not file_path.lower().endswith('.txt'):
+            file_path += '.txt'
+
+        try:
+            with open(file_path, 'wb') as f:
+                for i in range(self._messages.size()):
+                    msg = self._messages.get(i)
+                    request_bytes = msg.getRequest()
+                    if request_bytes:
+                        f.write(request_bytes)
+                        # 请求之间用空行分隔
+                        if i < self._messages.size() - 1:
+                            f.write(b'\r\n')
+
+            self._callbacks.printOutput(u"已导出 %d 个请求到: %s" % (self._messages.size(), file_path))
+        except Exception as e:
+            self._callbacks.printError(u"导出失败: %s" % e)
 
     # 右键弹出菜单监听器
     class _PopupListener(MouseAdapter):
@@ -712,8 +757,9 @@ class BulkRequester(IBurpExtender, ITab, IMessageEditorController):
             if event.isPopupTrigger():
                 row = self._outer._table.rowAtPoint(event.getPoint())
                 if row >= 0:
-                    self._outer._table.setRowSelectionInterval(row, row)
-                    # 右键菜单显示时直接使用视图行索引，具体操作中会转换
+                    # 如果右键点击的行不在当前选中范围内，则重新选择
+                    if not self._outer._table.isRowSelected(row):
+                        self._outer._table.setRowSelectionInterval(row, row)
                 self._outer._popup.show(self._outer._table, event.getX(), event.getY())
 
         def mousePressed(self, event):
